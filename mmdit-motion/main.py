@@ -113,13 +113,16 @@ class Config:
     # torch.compile (big speedup on H100; first compile is slower, hyper-conn may cause graph breaks)
     compile: bool = False
     flash_attn: bool = True        # joint attention uses flash (CUDA only)
-    tf32: bool = True              # enable TF32 matmul on Ampere+/H100 (free speedup)
+    # enable TF32 matmul on Ampere+/H100 (free speedup)
+    tf32: bool = True
 
     # io / relay
     ckpt_out: str = "ckpt.pt"
     resume: str = ""
-    save_every: int = 2000         # every N steps: update the rolling ckpt_out + save a non-overwriting step snapshot
-    snapshot_dir: str = ""         # folder for step snapshots (empty = snapshots/ next to ckpt_out)
+    # every N steps: update the rolling ckpt_out + save a non-overwriting step snapshot
+    save_every: int = 2000
+    # folder for step snapshots (empty = snapshots/ next to ckpt_out)
+    snapshot_dir: str = ""
     log_every: int = 50
     seed: int = 0
     num_workers: int = 2
@@ -538,7 +541,8 @@ def resolve_amp(cfg: Config, device: str):
         dtype = torch.bfloat16
     elif cfg.amp_dtype == "fp16":
         dtype = torch.float16
-    else:                                  # auto: bf16-capable cards (e.g. H100) use bf16
+    # auto: bf16-capable cards (e.g. H100) use bf16
+    else:
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     return True, dtype, (dtype == torch.float16)
 
@@ -586,7 +590,8 @@ def train(cfg: Config):
     fwd = model
     if cfg.compile and device == "cuda":
         fwd = torch.compile(model)
-        print("[compile] torch.compile on (first step is slower; drop --compile if it errors)")
+        print(
+            "[compile] torch.compile on (first step is slower; drop --compile if it errors)")
 
     snap_dir = cfg.snapshot_dir or os.path.join(
         os.path.dirname(os.path.abspath(cfg.ckpt_out)), "snapshots")
@@ -704,7 +709,8 @@ def run_summary(cfg: Config):
     from torchinfo import summary
 
     device = pick_device()
-    cfg.flash_attn = False                 # only inspecting architecture/params; flash doesn't affect layer structure or param count
+    # only inspecting architecture/params; flash doesn't affect layer structure or param count
+    cfg.flash_attn = False
     model = MotionMMDiT(cfg).to(device).eval()
 
     if cfg.resume and os.path.exists(cfg.resume):
