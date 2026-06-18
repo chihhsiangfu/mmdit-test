@@ -1,0 +1,20 @@
+[project]
+name = "mmdit-motion"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "ipykernel",
+  "numpy",
+  "matplotlib",
+  "torch",
+  "torchvision",
+  "torchinfo",
+  "gradio",
+  "transformers",
+  "sentencepiece",
+  "diffusers",
+  "accelerate",
+  "mmdit",
+]
