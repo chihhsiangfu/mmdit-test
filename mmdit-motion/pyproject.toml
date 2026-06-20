@@ -13,10 +13,10 @@ dependencies = [
   "torchinfo",
   "gradio",
   "transformers",
-  "sentencepiece",
   "diffusers",
+  "datasets",
   "accelerate",
+  "sentencepiece",
   "mmdit",
   "ema-pytorch",
-  "datasets",
 ]

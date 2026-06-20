@@ -24,29 +24,22 @@ uv run mmdit-motion/main.py download --data_root data/HumanML3D --max_per_split 
 It pulls the 263-dim features from a HuggingFace mirror (`TeoGchx/HumanML3D`, parquet) and
 writes the standard `--data_root` layout:
 
-  ```
-  <data_root>/
-    new_joint_vecs/<name>.npy   # (T, 263) motion features
-    texts/<name>.txt            # each line: caption#tokens#start#end
-    Mean.npy  Std.npy           # (263,) for normalization
-    train.txt val.txt test.txt  # split sample-name lists
-  ```
+```
+<data_root>/
+  new_joint_vecs/<name>.npy   # (T, 263) motion features
+  texts/<name>.txt            # each line: caption#tokens#start#end
+  Mean.npy  Std.npy           # (263,) for normalization
+  train.txt val.txt test.txt  # split sample-name lists
+```
 
 > The mirror is community-uploaded and derived from AMASS — use under the HumanML3D / AMASS
 > terms. You can also build this folder yourself via the official HumanML3D pipeline.
 
 ## Arguments
 
-`download` is a standalone command (its own table below). `train` / `sample` / `summary` all accept the **Shares** arguments below; each command then adds the arguments in its own table (`summary` adds none). **Model-structure args** (`dim_motion`, `depth`, `heads`, `dim_head`, `dim_cond`, `max_motion_len`, `num_residual_streams`, `repa`) define the network and **must match the checkpoint** when you `--resume`, `sample`, or load weights in `summary` — the model is rebuilt from the CLI args, not restored from the checkpoint. `flag` args are off by default; pass them to turn the behavior on.
+`train` / `sample` / `summary` all accept the **Shares** arguments below; each command then adds the arguments in its own table (`summary` adds none). **Model-structure args** (`dim_motion`, `depth`, `heads`, `dim_head`, `dim_cond`, `max_motion_len`, `num_residual_streams`, `repa`) define the network and **must match the checkpoint** when you `--resume`, `sample`, or load weights in `summary` — the model is rebuilt from the CLI args, not restored from the checkpoint. `flag` args are off by default; pass them to turn the behavior on.
 
-### Download
-
-| arg           | type | default             | description                                           |
-| ------------- | ---- | ------------------- | ----------------------------------------------------- |
-| data_root     | str  | _(required)_        | target folder for the standard HumanML3D layout       |
-| hf_dataset    | str  | `TeoGchx/HumanML3D` | HuggingFace datasets repo (263-dim HumanML3D parquet) |
-| splits        | str  | `train,val,test`    | comma-separated splits to materialize                 |
-| max_per_split | int  | `0`                 | `0` = all; e.g. `200` for a quick subset              |
+`download` is a standalone command (its own table below).
 
 ### Shares
 
@@ -101,3 +94,12 @@ writes the standard `--data_root` layout:
 ### Summary
 
 _No command-specific arguments — `summary` uses only the Shares arguments above._
+
+### Download
+
+| arg           | type | default             | description                                           |
+| ------------- | ---- | ------------------- | ----------------------------------------------------- |
+| data_root     | str  | _(required)_        | target folder for the standard HumanML3D layout       |
+| hf_dataset    | str  | `TeoGchx/HumanML3D` | HuggingFace datasets repo (263-dim HumanML3D parquet) |
+| splits        | str  | `train,val,test`    | comma-separated splits to materialize                 |
+| max_per_split | int  | `0`                 | `0` = all; e.g. `200` for a quick subset              |

@@ -755,12 +755,14 @@ def _write_mean_std(data_root):
 
     vec_dir = os.path.join(data_root, "new_joint_vecs")
     files = [f for f in os.listdir(vec_dir) if f.endswith(".npy")]
-    s = ss = None
+    if not files:
+        raise RuntimeError(f"no .npy motions under {vec_dir} to compute Mean/Std")
+    dim = int(np.load(os.path.join(vec_dir, files[0])).shape[1])
+    s = np.zeros(dim, dtype=np.float64)
+    ss = np.zeros(dim, dtype=np.float64)
     cnt = 0
     for f in files:
         m = np.load(os.path.join(vec_dir, f)).astype(np.float64)        # (T, D)
-        if s is None:
-            s, ss = np.zeros(m.shape[1]), np.zeros(m.shape[1])
         s += m.sum(0); ss += (m * m).sum(0); cnt += m.shape[0]
     mean = s / max(cnt, 1)
     std = np.sqrt(np.clip(ss / max(cnt, 1) - mean ** 2, 1e-12, None))
