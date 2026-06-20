@@ -1,46 +1,19 @@
 #!/usr/bin/env python
 """
-text-to-motion with lucidrains/mmdit  ──  flow matching (SiT-style) + optional REPA
-====================================================================================
+text-to-motion with lucidrains/mmdit — flow matching (SiT-style) + optional REPA.
 
-A ready-to-run text-to-motion training / sampling script. The backbone uses lucidrains/mmdit's
-generalized MMDiT (dual-stream joint attention). Design highlights:
+A single-file train / sample / summary script. Backbone: lucidrains/mmdit's generalized
+MMDiT (dual-stream joint attention). Method:
 
-  * Two modalities: text (CLIP token-level) + motion (HumanML3D 263-dim)
-  * SiT-style linear interpolant + velocity loss (rectified flow / flow matching)
-  * logit-normal timestep sampling (SD3 approach, can be disabled)
-  * classifier-free guidance (text dropout during training, dual-path interpolation at sampling)
-  * Optional REPA: hook the motion hidden of some MMDiTBlock layer and align it to a frozen motion encoder
-    (a stand-in encoder is used by default so the code path runs; for production replace it with TMR / MotionCLIP)
-  * checkpoint relay: --resume auto-resumes training (works on local / Colab / Kaggle; Kaggle needs separate read/write paths only because its input is read-only)
+  * text (CLIP token-level) + motion (HumanML3D 263-dim) as two modalities
+  * SiT linear interpolant + velocity loss (rectified flow)
+  * logit-normal timestep sampling (SD3) + classifier-free guidance
+  * optional REPA alignment; --resume auto-resumes (model + optimizer + EMA + step)
 
-Dependencies: already declared in mmdit-motion/pyproject.toml; uv run installs them automatically
-  (core: mmdit / torch / einops; transformers is only needed with --text_encoder clip)
-
-Examples:
-  # Smoke test first (no data, no download: dummy text encoder + synthetic motion, do not pass --data_root)
+Quick smoke test (no data, no download):
   uv run mmdit-motion/main.py train --text_encoder dummy --steps 50 --ckpt_out runs/ckpt.pt
 
-  # Training (real data)
-  uv run mmdit-motion/main.py train --data_root /path/to/HumanML3D --text_encoder clip \
-      --dim_motion 512 --depth 8 --batch_size 64 --steps 200000 --ckpt_out runs/ckpt.pt
-
-  # H100 optimization (= the training command plus bf16 + compile; other params same as defaults)
-  uv run mmdit-motion/main.py train --data_root /path/to/HumanML3D --text_encoder clip \
-      --dim_motion 512 --depth 8 --batch_size 64 --steps 200000 \
-      --amp_dtype bf16 --compile --save_every 5000 --ckpt_out runs/ckpt.pt
-
-  # Resume (--steps must be greater than the already-trained steps. Locally/Colab, resume and ckpt_out can be the same file)
-  uv run mmdit-motion/main.py train --data_root /path/to/HumanML3D \
-      --resume runs/ckpt.pt --ckpt_out runs/ckpt.pt --steps 400000
-
-  # Sampling
-  uv run mmdit-motion/main.py sample --resume runs/ckpt.pt \
-      --text_encoder clip --prompt "a person walks forward then sits down" \
-      --steps 50 --cfg 4.0 --out sample.npy
-
-  # View model architecture / parameter count (torchinfo)
-  uv run mmdit-motion/main.py summary --depth 8 --dim_motion 512
+See README.md for the full argument reference and the train / sample / summary commands.
 """
 
 import os
@@ -48,8 +21,7 @@ import math
 import shutil
 import argparse
 import random
-from dataclasses import dataclass, field, asdict
-from typing import Optional
+from dataclasses import dataclass, asdict
 
 import numpy as np
 import torch
@@ -60,6 +32,7 @@ from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
 
 from mmdit.mmdit_generalized_pytorch import MMDiT
+from ema_pytorch import EMA
 
 
 # ----------------------------------------------------------------------------- #
@@ -107,6 +80,9 @@ class Config:
     steps: int = 200_000
     warmup: int = 1000
     ema_decay: float = 0.999
+    # ema-pytorch: delay EMA start (model is noisy early) + update cadence
+    ema_update_after_step: int = 100
+    ema_update_every: int = 10
     amp: bool = True
     # 'auto'|'bf16'|'fp16' (auto: bf16-capable cards like H100 use bf16, otherwise fp16)
     amp_dtype: str = "auto"
@@ -412,8 +388,7 @@ def fm_loss(model, batch, text_tower, cfg, device):
         null = model.null_text.expand(motion.size(0), -1, -1)
         text_tokens = text_tokens.clone()
         text_mask = text_mask.clone()
-        # pad/truncate null to match text length is unnecessary: replace whole seq
-        # build a fresh masked tensor where dropped rows use the null token only
+        # dropped rows: replace the whole text seq with the null token (only position 0 unmasked)
         null_full = torch.zeros_like(text_tokens)
         null_full[:, :1] = null
         null_mask = torch.zeros_like(text_mask)
@@ -472,21 +447,16 @@ def sample(model, text_tower, cfg, prompts, device, steps=50, cfg_scale=4.0, len
 
 
 # ----------------------------------------------------------------------------- #
-# EMA + checkpoint relay
+# EMA helpers + checkpoint relay
+# (EMA itself is ema-pytorch: EMA(model, beta=...); call ema.update() each step)
 # ----------------------------------------------------------------------------- #
-class EMA:
-    def __init__(self, model, decay):
-        self.decay = decay
-        self.shadow = {k: v.detach().clone()
-                       for k, v in model.state_dict().items()}
-
-    @torch.no_grad()
-    def update(self, model):
-        for k, v in model.state_dict().items():
-            if v.dtype.is_floating_point:
-                self.shadow[k].mul_(self.decay).add_(v, alpha=1 - self.decay)
-            else:
-                self.shadow[k].copy_(v)
+def load_ema_into(model: nn.Module, ema_state: dict):
+    """Copy EMA weights from an ema-pytorch wrapper state_dict (keys prefixed
+    'ema_model.') into `model` in place."""
+    prefix = "ema_model."
+    weights = {k[len(prefix):]: v
+               for k, v in ema_state.items() if k.startswith(prefix)}
+    model.load_state_dict(weights)
 
 
 def save_ckpt(path, model, opt, ema, step, cfg):
@@ -494,7 +464,7 @@ def save_ckpt(path, model, opt, ema, step, cfg):
     torch.save({
         "model": model.state_dict(),
         "opt": opt.state_dict() if opt else None,
-        "ema": ema.shadow if ema else None,
+        "ema": ema.state_dict() if ema is not None else None,
         "step": step,
         "cfg": asdict(cfg),
     }, path)
@@ -503,10 +473,10 @@ def save_ckpt(path, model, opt, ema, step, cfg):
 def load_ckpt(path, model, opt=None, ema=None, map_location="cpu"):
     ck = torch.load(path, map_location=map_location)
     model.load_state_dict(ck["model"])
-    if opt and ck.get("opt"):
+    if opt is not None and ck.get("opt"):
         opt.load_state_dict(ck["opt"])
-    if ema and ck.get("ema"):
-        ema.shadow = ck["ema"]
+    if ema is not None and ck.get("ema") is not None:
+        ema.load_state_dict(ck["ema"])
     return ck.get("step", 0)
 
 
@@ -525,7 +495,7 @@ def pick_device():
 
 
 def setup_backend(cfg: Config, device: str):
-    """H100/Ampere-friendly settings: TF32 matmul (free speedup) + flash attention resolution (only meaningful on CUDA)."""
+    """H100/Ampere backend: enable TF32 matmul + resolve flash attention (both CUDA-only)."""
     if device == "cuda" and cfg.tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -569,14 +539,19 @@ def train(cfg: Config):
         f"(drop_last=True drops the tail smaller than one batch). Please reduce --batch_size.")
     steps_per_epoch = max(1, len(dl))
 
-    # always use this for EMA / saving / loading / clip / .train()
     model = MotionMMDiT(cfg).to(device)
     repa_target = StandInMotionEncoder(
         cfg.motion_dim, cfg.repa_dim).to(device) if cfg.repa else None
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
-    ema = EMA(model, cfg.ema_decay)
+    ema = EMA(
+        model,
+        beta=cfg.ema_decay,
+        update_after_step=cfg.ema_update_after_step,
+        update_every=cfg.ema_update_every,
+        include_online_model=False,   # online weights are saved separately under "model"
+    )
 
     amp_enabled, amp_dtype, use_scaler = resolve_amp(cfg, device)
     scaler = GradScaler(enabled=use_scaler)
@@ -634,7 +609,7 @@ def train(cfg: Config):
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             scaler.step(opt)
             scaler.update()
-            ema.update(model)
+            ema.update()
 
             running += loss.item()
             n_batches += 1
@@ -646,8 +621,7 @@ def train(cfg: Config):
                 msg += f" | lr {opt.param_groups[0]['lr']:.2e}"
                 print(msg, flush=True)
 
-            # every N steps: update the rolling ckpt_out (latest, convenient for resume / preempt safety)
-            # + save a non-overwriting step snapshot (milestone; copy bytes to save a serialization)
+            # refresh the rolling ckpt, then copy it to a non-overwriting milestone snapshot
             if cfg.save_every and step > start and step % cfg.save_every == 0:
                 save_ckpt(cfg.ckpt_out, model, opt, ema, step, cfg)
                 os.makedirs(snap_dir, exist_ok=True)
@@ -687,8 +661,10 @@ def run_sample(cfg: Config, prompt: str, steps: int, cfg_scale: float,
     assert cfg.resume and os.path.exists(
         cfg.resume), "need --resume <ckpt> to sample"
     ck = torch.load(cfg.resume, map_location=device)
-    state = ck["ema"] if (use_ema and ck.get("ema")) else ck["model"]
-    model.load_state_dict(state)
+    if use_ema and ck.get("ema"):
+        load_ema_into(model, ck["ema"])
+    else:
+        model.load_state_dict(ck["model"])
     print(
         f"[sample] loaded {'EMA' if use_ema and ck.get('ema') else 'model'} from {cfg.resume}")
 
@@ -703,7 +679,7 @@ def run_sample(cfg: Config, prompt: str, steps: int, cfg_scale: float,
 
 
 # ----------------------------------------------------------------------------- #
-# summary CLI (torchinfo: inspect MMDiT architecture and parameter count, consistent with summary.py in mmdit-*-test)
+# summary CLI (torchinfo: inspect MMDiT architecture and parameter count)
 # ----------------------------------------------------------------------------- #
 def run_summary(cfg: Config):
     from torchinfo import summary

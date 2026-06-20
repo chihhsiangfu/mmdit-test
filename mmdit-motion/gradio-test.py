@@ -1,10 +1,9 @@
 #!/usr/bin/env python
 """Gradio app: load a trained text-to-motion MMDiT, enter a prompt → generate motion → display it as a 3D skeleton animation.
 
-Same purpose as the gradio-test.py in the other mmdit-*-test projects (load a trained model for a demo);
-the difference is that what we display here is motion, so the approach is:
+Pipeline:
 
-  prompt ─T5/CLIP─▶ MMDiT(Rectified Flow ODE) ─▶ (T,263) HumanML3D features
+  prompt ─CLIP─▶ MMDiT(Rectified Flow ODE) ─▶ (T,263) HumanML3D features
         ─denormalize─▶ recover_from_ric ─▶ (T,22,3) joint xyz trajectories
         ─matplotlib 3D skeleton + FuncAnimation─▶ animated GIF (the browser plays it automatically)
 
@@ -35,8 +34,8 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 
 import gradio as gr
 
-# main.py in the same folder (flat import, consistent with main.py itself)
-from main import Config, MotionMMDiT, build_text_tower, sample, pick_device, setup_backend
+# flat import: main.py lives in the same folder
+from main import Config, MotionMMDiT, build_text_tower, sample, pick_device, setup_backend, load_ema_into
 
 
 # --------------------------------------------------------------
@@ -138,8 +137,10 @@ def load_model(ckpt_path, use_ema, device):
     cfg.dim_text = text_tower.dim       # sync with training: text width follows the encoder
     model = MotionMMDiT(cfg).to(device)
 
-    state = ck["ema"] if (use_ema and ck.get("ema")) else ck["model"]
-    model.load_state_dict(state)
+    if use_ema and ck.get("ema"):
+        load_ema_into(model, ck["ema"])
+    else:
+        model.load_state_dict(ck["model"])
     model.eval()
     tag = "EMA" if (use_ema and ck.get("ema")) else "model"
     print(f"loaded {tag} from {ckpt_path}  (step={ck.get('step', '?')}, text={cfg.text_encoder})")

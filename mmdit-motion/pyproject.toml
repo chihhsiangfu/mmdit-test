@@ -17,4 +17,5 @@ dependencies = [
   "diffusers",
   "accelerate",
   "mmdit",
+  "ema-pytorch",
 ]
