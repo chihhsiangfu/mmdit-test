@@ -193,9 +193,9 @@ def render_motion_gif(joints, fps=20):
 # --------------------------------------------------------------
 
 @torch.no_grad()
-def generate_motion(model, text_tower, cfg, device, stats, prompt, cfg_scale, steps, length):
+def generate_motion(model, text_tower, cfg, device, stats, prompt, cfg_scale, steps, shift, length):
     x = sample(model, text_tower, cfg, [prompt], device,
-               steps=int(steps), cfg_scale=float(cfg_scale), length=int(length))
+               steps=int(steps), cfg_scale=float(cfg_scale), length=int(length), shift=float(shift))
     arr = x[0].float().cpu().numpy()                      # (L, 263) normalized
     if stats is not None:                                 # restore to real scale
         mean, std = stats
@@ -212,9 +212,9 @@ def build_demo(model, text_tower, cfg, device, stats):
     note = "" if stats is not None else \
         "\n\n> ⚠️ No `--data_root` (Mean/Std) provided, so motion is shown in normalized space and the scale/proportions will be off."
 
-    def _gen(prompt, cfg_scale, steps, length):
+    def _gen(prompt, cfg_scale, steps, shift, length):
         return generate_motion(model, text_tower, cfg, device, stats,
-                               prompt, cfg_scale, steps, length)
+                               prompt, cfg_scale, steps, shift, length)
 
     max_len = int(cfg.max_motion_len)
     with gr.Blocks(title="MMDiT · text-to-motion") as demo:
@@ -228,12 +228,13 @@ def build_demo(model, text_tower, cfg, device, stats):
                     value="a person walks forward then sits down")
                 cfg_s = gr.Slider(1.0, 8.0, value=4.0, step=0.5, label="CFG scale")
                 steps_s = gr.Slider(10, 100, value=50, step=5, label="ODE steps")
+                shift_s = gr.Slider(1.0, 6.0, value=3.0, step=0.5, label="Timestep shift (SD3)")
                 len_s = gr.Slider(min(20, max_len), max_len,
                                   value=min(120, max_len), step=1, label="Frames (length)")
                 btn = gr.Button("Generate", variant="primary")
             with gr.Column(scale=2):
                 out = gr.Image(label="3D motion", type="filepath")
-        btn.click(fn=_gen, inputs=[prompt, cfg_s, steps_s, len_s], outputs=out)
+        btn.click(fn=_gen, inputs=[prompt, cfg_s, steps_s, shift_s, len_s], outputs=out)
     return demo
 
 

@@ -5,9 +5,10 @@ text-to-motion with lucidrains/mmdit — flow matching (SiT-style) + optional RE
 A single-file train / sample / summary script. Backbone: lucidrains/mmdit's generalized
 MMDiT (dual-stream joint attention). Method:
 
-  * text (CLIP token-level) + motion (HumanML3D 263-dim) as two modalities
+  * two modalities: text (CLIP) + motion (HumanML3D 263-dim); token-level text goes to
+    joint attention, pooled text is added to the adaLN timestep modulation (SD3-style)
   * SiT linear interpolant + velocity loss (rectified flow)
-  * logit-normal timestep sampling (SD3) + classifier-free guidance
+  * logit-normal timestep sampling + SD3 timestep shift at sampling + classifier-free guidance
   * optional REPA alignment; --resume auto-resumes (model + optimizer + EMA + step)
 
 Quick smoke test (no data, no download):
@@ -108,7 +109,7 @@ class Config:
 # text encoders
 # ----------------------------------------------------------------------------- #
 class CLIPTextTower(nn.Module):
-    """Frozen CLIP text encoder → token-level embeddings + mask."""
+    """Frozen CLIP text encoder → token-level embeddings + mask + pooled (sentence) vector."""
 
     def __init__(self, cfg: Config):
         super().__init__()
@@ -126,9 +127,11 @@ class CLIPTextTower(nn.Module):
             prompts, padding="max_length", truncation=True,
             max_length=self.max_text_len, return_tensors="pt",
         ).to(device)
-        out = self.model(**batch).last_hidden_state          # (B, L, D)
+        out = self.model(**batch)
+        tokens = out.last_hidden_state                       # (B, L, D) token-level
+        pooled = out.pooler_output                           # (B, D) sentence-level (EOS token)
         mask = batch["attention_mask"].bool()                # (B, L)
-        return out, mask
+        return tokens, mask, pooled
 
 
 class DummyTextTower(nn.Module):
@@ -151,7 +154,9 @@ class DummyTextTower(nn.Module):
                     hash(w) % (2**31))
                 embs[i, j] = torch.randn(D, generator=g).to(device)
                 masks[i, j] = True
-        return embs, masks
+        m = masks.unsqueeze(-1).float()
+        pooled = (embs * m).sum(1) / m.sum(1).clamp(min=1)   # (B, D) masked mean
+        return embs, masks, pooled
 
 
 def build_text_tower(cfg: Config):
@@ -312,6 +317,10 @@ class MotionMMDiT(nn.Module):
 
         # learned null text for classifier-free guidance
         self.null_text = nn.Parameter(torch.randn(1, 1, cfg.dim_text) * 0.02)
+        # learned null pooled-text (the unconditional pooled vector for CFG)
+        self.null_pooled = nn.Parameter(torch.randn(1, cfg.dim_text) * 0.02)
+        # project pooled text → dim_cond, added to the timestep modulation (SD3-style)
+        self.text_pool_proj = nn.Linear(cfg.dim_text, cfg.dim_cond)
 
         self.mmdit = MMDiT(
             depth=cfg.depth,
@@ -341,10 +350,11 @@ class MotionMMDiT(nn.Module):
                 self.repa_feat = motion_hidden
             self.mmdit.blocks[cfg.repa_layer].register_forward_hook(_hook)
 
-    def forward(self, noised_motion, t, text_tokens, text_mask, motion_mask):
+    def forward(self, noised_motion, t, text_tokens, text_mask, motion_mask, text_pooled):
         x = self.motion_in(noised_motion) + \
             self.pos_emb[:, : noised_motion.size(1)]
-        time_cond = self.time_mlp(t)
+        # adaLN conditioning = timestep embedding + projected pooled text (SD3-style)
+        time_cond = self.time_mlp(t) + self.text_pool_proj(text_pooled)
         out_text, out_motion = self.mmdit(
             modality_tokens=(text_tokens, x),
             modality_masks=(text_mask, motion_mask),
@@ -380,9 +390,9 @@ def fm_loss(model, batch, text_tower, cfg, device):
     mmask = batch["mask"].to(device)                       # (B,L)
     prompts = batch["text"]
 
-    text_tokens, text_mask = text_tower(prompts, device)
+    text_tokens, text_mask, text_pooled = text_tower(prompts, device)
 
-    # classifier-free guidance: randomly drop text → learned null token
+    # classifier-free guidance: randomly drop text → learned null token + null pooled
     drop = torch.rand(motion.size(0), device=device) < cfg.p_uncond
     if drop.any():
         null = model.null_text.expand(motion.size(0), -1, -1)
@@ -395,6 +405,8 @@ def fm_loss(model, batch, text_tower, cfg, device):
         null_mask[:, 0] = True
         text_tokens = torch.where(drop[:, None, None], null_full, text_tokens)
         text_mask = torch.where(drop[:, None], null_mask, text_mask)
+        null_pooled = model.null_pooled.expand(motion.size(0), -1)
+        text_pooled = torch.where(drop[:, None], null_pooled, text_pooled)
 
     # SiT linear interpolant: x0=data, x1=noise, x_t=(1-t)x0 + t x1, v* = x1 - x0
     t = sample_t(motion.size(0), device, cfg.logit_normal_t)
@@ -403,7 +415,7 @@ def fm_loss(model, batch, text_tower, cfg, device):
     x_t = (1 - tt) * motion + tt * noise
     v_target = noise - motion
 
-    v_pred = model(x_t, t, text_tokens, text_mask, mmask)
+    v_pred = model(x_t, t, text_tokens, text_mask, mmask, text_pooled)
 
     m = mmask.unsqueeze(-1).float()
     loss = (((v_pred - v_target) ** 2) * m).sum() / \
@@ -412,31 +424,35 @@ def fm_loss(model, batch, text_tower, cfg, device):
 
 
 # ----------------------------------------------------------------------------- #
-# sampling (Euler ODE, noise t=1 → data t=0)
+# sampling (Euler ODE, noise t=1 → data t=0, SD3 timestep shift)
 # ----------------------------------------------------------------------------- #
 @torch.no_grad()
-def sample(model, text_tower, cfg, prompts, device, steps=50, cfg_scale=4.0, length=None):
+def sample(model, text_tower, cfg, prompts, device, steps=50, cfg_scale=4.0, length=None, shift=3.0):
     model.eval()
     B = len(prompts)
     L = length or cfg.max_motion_len
     mmask = torch.ones(B, L, dtype=torch.bool, device=device)
 
-    text_tokens, text_mask = text_tower(prompts, device)
+    text_tokens, text_mask, text_pooled = text_tower(prompts, device)
     null = model.null_text.expand(B, -1, -1)
     null_tokens = torch.zeros_like(text_tokens)
     null_tokens[:, :1] = null
     null_mask = torch.zeros_like(text_mask)
     null_mask[:, 0] = True
+    null_pooled = model.null_pooled.expand(B, -1)
 
     # start from noise (t=1)
     x = torch.randn(B, L, cfg.motion_dim, device=device)
+    # SD3 timestep shift: warp the schedule toward higher noise (shift>1; shift=1 disables)
     ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    if shift != 1.0:
+        ts = shift * ts / (1 + (shift - 1) * ts)
     for i in range(steps):
         t = ts[i].expand(B)
         dt = (ts[i] - ts[i + 1]).item()                    # positive
-        v_c = model(x, t, text_tokens, text_mask, mmask)
+        v_c = model(x, t, text_tokens, text_mask, mmask, text_pooled)
         if cfg_scale != 1.0:
-            v_u = model(x, t, null_tokens, null_mask, mmask)
+            v_u = model(x, t, null_tokens, null_mask, mmask, null_pooled)
             v = v_u + cfg_scale * (v_c - v_u)
         else:
             v = v_c
@@ -651,7 +667,7 @@ def train(cfg: Config):
 # sample CLI
 # ----------------------------------------------------------------------------- #
 def run_sample(cfg: Config, prompt: str, steps: int, cfg_scale: float,
-               out: str, use_ema: bool):
+               out: str, use_ema: bool, shift: float):
     device = pick_device()
     setup_backend(cfg, device)
     text_tower = build_text_tower(cfg).to(device)
@@ -669,7 +685,7 @@ def run_sample(cfg: Config, prompt: str, steps: int, cfg_scale: float,
         f"[sample] loaded {'EMA' if use_ema and ck.get('ema') else 'model'} from {cfg.resume}")
 
     x = sample(model, text_tower, cfg, [prompt], device,
-               steps=steps, cfg_scale=cfg_scale)
+               steps=steps, cfg_scale=cfg_scale, shift=shift)
     arr = x[0].float().cpu().numpy()                       # (L,263) normalized
     # NOTE: de-normalize with the dataset Mean/Std before feeding a renderer:
     #   motion = arr * (Std + 1e-8) + Mean
@@ -696,7 +712,7 @@ def run_summary(cfg: Config):
     else:
         print("[summary] no weights loaded, showing architecture (layer structure and param count are identical)\n")
 
-    # forward needs 5 inputs; use dummy (don't load CLIP / motion encoder, just inspect the MMDiT body)
+    # forward needs 6 inputs; use dummy (don't load CLIP / motion encoder, just inspect the MMDiT body)
     B, L, Lt = 1, cfg.max_motion_len, cfg.max_text_len
     dummy = (
         torch.randn(B, L, cfg.motion_dim, device=device),       # noised_motion
@@ -704,6 +720,7 @@ def run_summary(cfg: Config):
         torch.randn(B, Lt, cfg.dim_text, device=device),        # text_tokens
         torch.ones(B, Lt, dtype=torch.bool, device=device),     # text_mask
         torch.ones(B, L, dtype=torch.bool, device=device),      # motion_mask
+        torch.randn(B, cfg.dim_text, device=device),            # text_pooled
     )
     summary(
         model,
@@ -769,6 +786,7 @@ def main():
     ps.add_argument("--prompt", required=True)
     ps.add_argument("--steps", type=int, default=50)
     ps.add_argument("--cfg", type=float, default=4.0)
+    ps.add_argument("--shift", type=float, default=3.0)
     ps.add_argument("--out", default="sample.npy")
     ps.add_argument("--use_ema", action="store_true")
 
@@ -787,7 +805,7 @@ def main():
             cfg.tf32 = False
         train(cfg)
     elif a.cmd == "sample":
-        run_sample(cfg, a.prompt, a.steps, a.cfg, a.out, a.use_ema)
+        run_sample(cfg, a.prompt, a.steps, a.cfg, a.out, a.use_ema, a.shift)
     else:  # summary
         run_summary(cfg)
 

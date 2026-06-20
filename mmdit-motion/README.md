@@ -72,6 +72,7 @@ cd mmdit-test && uv sync
 | prompt  | str   | _(required)_ | text description to generate motion from                   |
 | steps   | int   | 50           | number of Euler ODE sampling steps                         |
 | cfg     | float | 4.0          | classifier-free guidance scale (`1.0` = disabled)          |
+| shift   | float | 3.0          | SD3 timestep shift on the sampling schedule (`1.0` = off)  |
 | out     | str   | `sample.npy` | output path for the generated **normalized** motion `.npy` |
 | use_ema | flag  | off          | load EMA-averaged weights instead of the raw model         |
 
