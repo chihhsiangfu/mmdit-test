@@ -2,7 +2,7 @@
 """
 text-to-motion with lucidrains/mmdit — flow matching (SiT-style) + optional REPA.
 
-A single-file train / sample / summary script. Backbone: lucidrains/mmdit's generalized
+A single-file download / train / sample / summary script. Backbone: lucidrains/mmdit's generalized
 MMDiT (dual-stream joint attention). Method:
 
   * two modalities: text (CLIP) + motion (HumanML3D 263-dim); token-level text goes to
@@ -11,10 +11,13 @@ MMDiT (dual-stream joint attention). Method:
   * logit-normal timestep sampling + SD3 timestep shift at sampling + classifier-free guidance
   * optional REPA alignment; --resume auto-resumes (model + optimizer + EMA + step)
 
+Get real data (HumanML3D from a HuggingFace mirror — no AMASS pipeline):
+  uv run mmdit-motion/main.py download --data_root data/HumanML3D
+
 Quick smoke test (no data, no download):
   uv run mmdit-motion/main.py train --text_encoder dummy --steps 50 --ckpt_out runs/ckpt.pt
 
-See README.md for the full argument reference and the train / sample / summary commands.
+See README.md for the full argument reference and the download / train / sample / summary commands.
 """
 
 import os
@@ -732,6 +735,80 @@ def run_summary(cfg: Config):
 
 
 # ----------------------------------------------------------------------------- #
+# download CLI (fetch HumanML3D from a HuggingFace mirror → standard data_root layout)
+# ----------------------------------------------------------------------------- #
+STATS_REPO = "NamYeongCho/HumanML3D"   # tiny canonical Mean.npy / Std.npy live here
+
+
+def _write_mean_std(data_root):
+    """Fetch the canonical 263-dim Mean/Std (tiny) from a mirror; if that fails,
+    compute them from the downloaded new_joint_vecs (per-dim over all frames)."""
+    try:
+        from huggingface_hub import hf_hub_download
+        for fn in ("Mean.npy", "Std.npy"):
+            src = hf_hub_download(repo_id=STATS_REPO, filename=fn, repo_type="dataset")
+            shutil.copyfile(src, os.path.join(data_root, fn))
+        print(f"[download] Mean/Std: fetched canonical stats from {STATS_REPO}", flush=True)
+        return
+    except Exception as e:
+        print(f"[download] Mean/Std: canonical fetch failed ({e}); computing from data ...", flush=True)
+
+    vec_dir = os.path.join(data_root, "new_joint_vecs")
+    files = [f for f in os.listdir(vec_dir) if f.endswith(".npy")]
+    s = ss = None
+    cnt = 0
+    for f in files:
+        m = np.load(os.path.join(vec_dir, f)).astype(np.float64)        # (T, D)
+        if s is None:
+            s, ss = np.zeros(m.shape[1]), np.zeros(m.shape[1])
+        s += m.sum(0); ss += (m * m).sum(0); cnt += m.shape[0]
+    mean = s / max(cnt, 1)
+    std = np.sqrt(np.clip(ss / max(cnt, 1) - mean ** 2, 1e-12, None))
+    np.save(os.path.join(data_root, "Mean.npy"), mean.astype(np.float32))
+    np.save(os.path.join(data_root, "Std.npy"), std.astype(np.float32))
+    print(f"[download] Mean/Std: computed from {len(files)} motions ({cnt} frames)", flush=True)
+
+
+def run_download(data_root, hf_dataset, splits, max_per_split):
+    from datasets import load_dataset
+    vec_dir = os.path.join(data_root, "new_joint_vecs")
+    txt_dir = os.path.join(data_root, "texts")
+    os.makedirs(vec_dir, exist_ok=True)
+    os.makedirs(txt_dir, exist_ok=True)
+
+    total = 0
+    for split in [s.strip() for s in splits.split(",") if s.strip()]:
+        print(f"[download] streaming split '{split}' from {hf_dataset} "
+              f"(first rows trigger the download/cache) ...", flush=True)
+        ds = load_dataset(hf_dataset, split=split, streaming=True)
+        names = []
+        for i, row in enumerate(ds):
+            if max_per_split and i >= max_per_split:
+                break
+            if not row["caption"].strip():
+                continue
+            name = row["meta_data"]["name"]
+            motion = np.asarray(row["motion"], dtype=np.float32)        # (T, 263)
+            np.save(os.path.join(vec_dir, name + ".npy"), motion)
+            with open(os.path.join(txt_dir, name + ".txt"), "w") as f:
+                f.write(row["caption"])         # already HumanML3D 'caption#tokens#start#end' lines
+            names.append(name)
+            if (i + 1) % 500 == 0:
+                print(f"[download]   {split}: {i + 1} motions ...", flush=True)
+        with open(os.path.join(data_root, f"{split}.txt"), "w") as f:
+            f.write("\n".join(names) + "\n")
+        total += len(names)
+        print(f"[download] split '{split}': {len(names)} motions → {split}.txt", flush=True)
+
+    _write_mean_std(data_root)
+    print(f"[download] DONE → {data_root}  ({total} motions).  "
+          f"Train with:  --data_root {data_root}", flush=True)
+    # datasets' streaming HTTP layer can leave non-daemon threads that stall interpreter
+    # exit; everything is written and stdout is flushed, so terminate the CLI promptly.
+    os._exit(0)
+
+
+# ----------------------------------------------------------------------------- #
 # argparse
 # ----------------------------------------------------------------------------- #
 def add_common(p):
@@ -793,6 +870,15 @@ def main():
     psum = sub.add_parser("summary")
     add_common(psum)
 
+    pdl = sub.add_parser("download")
+    pdl.add_argument("--data_root", required=True,
+                     help="target folder for the standard HumanML3D layout")
+    pdl.add_argument("--hf_dataset", default="TeoGchx/HumanML3D",
+                     help="HuggingFace datasets repo (263-dim HumanML3D parquet)")
+    pdl.add_argument("--splits", default="train,val,test")
+    pdl.add_argument("--max_per_split", type=int, default=0,
+                     help="0 = all; set e.g. 200 for a quick subset")
+
     a = ap.parse_args()
     cfg = cfg_from_args(a)
 
@@ -806,6 +892,8 @@ def main():
         train(cfg)
     elif a.cmd == "sample":
         run_sample(cfg, a.prompt, a.steps, a.cfg, a.out, a.use_ema, a.shift)
+    elif a.cmd == "download":
+        run_download(a.data_root, a.hf_dataset, a.splits, a.max_per_split)
     else:  # summary
         run_summary(cfg)
 
