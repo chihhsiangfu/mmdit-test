@@ -103,3 +103,11 @@ _No command-specific arguments — `summary` uses only the Shares arguments abov
 | hf_dataset    | str  | `TeoGchx/HumanML3D` | HuggingFace datasets repo (263-dim HumanML3D parquet) |
 | splits        | str  | `train,val,test`    | comma-separated splits to materialize                 |
 | max_per_split | int  | `0`                 | `0` = all; e.g. `200` for a quick subset              |
+
+## Notebooks
+
+| file                        | description                                     |
+| --------------------------- | ----------------------------------------------- |
+| for-test.ipynb              | for smoke test                                  |
+| for-training-on-local.ipynb | for training on local machine                   |
+| for-training-on-colab.ipynb | for training on colab, especially for H100/A100 |
