@@ -26,6 +26,7 @@ import shutil
 import zlib
 import argparse
 import random
+from typing import cast
 from dataclasses import dataclass, asdict
 
 import numpy as np
@@ -37,6 +38,7 @@ from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
 
 from mmdit.mmdit_generalized_pytorch import MMDiT
+from mmdit.mmdit_pytorch import JointAttention, MultiHeadRMSNorm
 from ema_pytorch import EMA
 
 
@@ -63,7 +65,7 @@ class Config:
     heads: int = 8
     dim_head: int = 64
     dim_cond: int = 256            # timestep conditioning width
-    qk_rmsnorm: bool = True
+    qk_rmsnorm: bool = True        # SD3-style QK-RMSNorm (wired in by hand; see _enable_qk_rmsnorm)
     num_residual_streams: int = 4
 
     # flow matching
@@ -311,6 +313,24 @@ class StandInMotionEncoder(nn.Module):
 # ----------------------------------------------------------------------------- #
 # the model
 # ----------------------------------------------------------------------------- #
+def _enable_qk_rmsnorm(mmdit: MMDiT, dim_head: int, heads: int):
+    """Switch on QK-RMSNorm in every block's JointAttention.
+
+    lucidrains' *generalized* MMDiTBlock accepts a `qk_rmsnorm` kwarg but never forwards it to
+    the JointAttention it builds, so passing it through MMDiT(...) is a silent no-op. SD3 relies
+    on QK-RMSNorm to keep attention logits well-scaled, so we add the per-head q/k RMSNorms by
+    hand — exactly what JointAttention.__init__ does for qk_rmsnorm=True, leaving the existing
+    qkv/out projections untouched. The new norms register as submodules (state_dict + .to()).
+    """
+    for block in mmdit.blocks:
+        attn = cast(JointAttention, block.joint_attn)
+        attn.qk_rmsnorm = True
+        attn.q_rmsnorms = nn.ModuleList(
+            [MultiHeadRMSNorm(dim_head, heads=heads) for _ in range(attn.num_inputs)])
+        attn.k_rmsnorms = nn.ModuleList(
+            [MultiHeadRMSNorm(dim_head, heads=heads) for _ in range(attn.num_inputs)])
+
+
 class MotionMMDiT(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -335,10 +355,12 @@ class MotionMMDiT(nn.Module):
             dim_cond=cfg.dim_cond,
             heads=cfg.heads,
             dim_head=cfg.dim_head,
-            qk_rmsnorm=cfg.qk_rmsnorm,
             flash_attn=cfg.flash_attn,
             num_residual_streams=cfg.num_residual_streams,
         )
+        # generalized MMDiT drops the qk_rmsnorm kwarg, so enable SD3-style QK-RMSNorm by hand
+        if cfg.qk_rmsnorm:
+            _enable_qk_rmsnorm(self.mmdit, dim_head=cfg.dim_head, heads=cfg.heads)
 
         # ---- REPA hook (optional) ----
         self.repa_feat = None
