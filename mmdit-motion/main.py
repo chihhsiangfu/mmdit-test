@@ -23,6 +23,7 @@ See README.md for the full argument reference and the download / train / sample 
 import os
 import math
 import shutil
+import zlib
 import argparse
 import random
 from dataclasses import dataclass, asdict
@@ -83,6 +84,8 @@ class Config:
     grad_clip: float = 1.0
     steps: int = 200_000
     warmup: int = 1000
+    # ema-pytorch treats this as the decay *ceiling* (beta) of its Karras warmup schedule, not a
+    # constant; effective decay ramps toward it over ~tens of thousands of updates
     ema_decay: float = 0.999
     # ema-pytorch: delay EMA start (model is noisy early) + update cadence
     ema_update_after_step: int = 100
@@ -153,8 +156,9 @@ class DummyTextTower(nn.Module):
         for i, p in enumerate(prompts):
             words = (p.split() or ["<empty>"])[:L]
             for j, w in enumerate(words):
-                g = torch.Generator(device="cpu").manual_seed(
-                    hash(w) % (2**31))
+                # zlib.crc32 gives a stable per-word seed across processes; the builtin hash()
+                # is salted per-process (PYTHONHASHSEED), so it wouldn't match between runs
+                g = torch.Generator(device="cpu").manual_seed(zlib.crc32(w.encode()))
                 embs[i, j] = torch.randn(D, generator=g).to(device)
                 masks[i, j] = True
         m = masks.unsqueeze(-1).float()
@@ -431,6 +435,7 @@ def fm_loss(model, batch, text_tower, cfg, device):
 # ----------------------------------------------------------------------------- #
 @torch.no_grad()
 def sample(model, text_tower, cfg, prompts, device, steps=50, cfg_scale=4.0, length=None, shift=3.0):
+    was_training = model.training
     model.eval()
     B = len(prompts)
     L = length or cfg.max_motion_len
@@ -460,7 +465,7 @@ def sample(model, text_tower, cfg, prompts, device, steps=50, cfg_scale=4.0, len
         else:
             v = v_c
         x = x - dt * v                                     # Euler step toward data
-    model.train()
+    model.train(was_training)                              # restore caller's prior mode
     # (B,L,263) normalized space
     return x
 
@@ -583,9 +588,14 @@ def train(cfg: Config):
     # used for forward; after compile it's a wrapped callable, while other ops still use model
     fwd = model
     if cfg.compile and device == "cuda":
-        fwd = torch.compile(model)
-        print(
-            "[compile] torch.compile on (first step is slower; drop --compile if it errors)")
+        if cfg.repa:
+            # the REPA forward hook stashes repa_feat as a Python side effect; torch.compile
+            # graph-breaks on it (or captures a stale value), so skip compile when REPA is on
+            print("[compile] disabled: incompatible with the REPA forward hook; training without compile")
+        else:
+            fwd = torch.compile(model)
+            print(
+                "[compile] torch.compile on (first step is slower; drop --compile if it errors)")
 
     snap_dir = cfg.snapshot_dir or os.path.join(
         os.path.dirname(os.path.abspath(cfg.ckpt_out)), "snapshots")
@@ -706,10 +716,19 @@ def run_summary(cfg: Config):
     device = pick_device()
     # only inspecting architecture/params; flash doesn't affect layer structure or param count
     cfg.flash_attn = False
-    model = MotionMMDiT(cfg).to(device).eval()
 
+    # summary builds no text encoder, so (unlike train/sample) it can't infer dim_text from one.
+    # When resuming, take it from the checkpoint's cfg so a non-default CLIP width still loads.
+    ck = None
     if cfg.resume and os.path.exists(cfg.resume):
         ck = torch.load(cfg.resume, map_location=device)
+        saved_dim_text = ck.get("cfg", {}).get("dim_text")
+        if saved_dim_text:
+            cfg.dim_text = saved_dim_text
+
+    model = MotionMMDiT(cfg).to(device).eval()
+
+    if ck is not None:
         model.load_state_dict(ck["model"])
         print(f"[summary] loaded weights from {cfg.resume}\n")
     else:
@@ -784,8 +803,10 @@ def run_download(data_root, hf_dataset, splits, max_per_split):
               f"(first rows trigger the download/cache) ...", flush=True)
         ds = load_dataset(hf_dataset, split=split, streaming=True)
         names = []
-        for i, row in enumerate(ds):
-            if max_per_split and i >= max_per_split:
+        for row in ds:
+            # count written samples (not raw rows), so empty-caption skips don't eat into the
+            # budget — `--max_per_split 200` yields 200 usable samples
+            if max_per_split and len(names) >= max_per_split:
                 break
             if not row["caption"].strip():
                 continue
@@ -795,8 +816,8 @@ def run_download(data_root, hf_dataset, splits, max_per_split):
             with open(os.path.join(txt_dir, name + ".txt"), "w") as f:
                 f.write(row["caption"])         # already HumanML3D 'caption#tokens#start#end' lines
             names.append(name)
-            if (i + 1) % 500 == 0:
-                print(f"[download]   {split}: {i + 1} motions ...", flush=True)
+            if len(names) % 500 == 0:
+                print(f"[download]   {split}: {len(names)} motions ...", flush=True)
         with open(os.path.join(data_root, f"{split}.txt"), "w") as f:
             f.write("\n".join(names) + "\n")
         total += len(names)

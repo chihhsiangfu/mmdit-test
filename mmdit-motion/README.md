@@ -62,6 +62,8 @@ writes the standard `--data_root` layout:
 
 > Not every shared arg affects every command: `data_root` → `train` only; `text_encoder` / `clip_name` → `train` and `sample` (`summary` uses no text encoder); `repa_layer` / `repa_weight` → `train` only.
 
+> **REPA is a stub by default.** The alignment target (`StandInMotionEncoder`) is a _randomly-initialized, frozen_ GRU, so the auxiliary loss aligns to a random projection and will not improve quality until you replace it with a pretrained motion encoder (e.g. TMR / MotionCLIP). Leave `--repa` off unless you have swapped in a real target.
+
 ### Train
 
 | arg          | type  | default   | description                                                                                        |
@@ -76,7 +78,7 @@ writes the standard `--data_root` layout:
 | ckpt_out     | str   | `ckpt.pt` | path of the rolling (latest) checkpoint                                                            |
 | no_amp       | flag  | off       | disable AMP mixed precision (AMP is active on CUDA only)                                           |
 | amp_dtype    | str   | `auto`    | AMP dtype — `auto` (bf16 on bf16-capable GPUs e.g. H100, else fp16) / `bf16` / `fp16`              |
-| compile      | flag  | off       | enable `torch.compile` (CUDA only; large H100 speedup, slower first step)                          |
+| compile      | flag  | off       | enable `torch.compile` (CUDA only; large H100 speedup, slower first step; auto-disabled with `--repa`) |
 | no_flash     | flag  | off       | disable flash attention (flash is CUDA-only regardless)                                            |
 | no_tf32      | flag  | off       | disable TF32 matmul (applies only on CUDA Ampere+/H100)                                            |
 

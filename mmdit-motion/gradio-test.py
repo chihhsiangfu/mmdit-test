@@ -8,10 +8,10 @@ Pipeline:
         ─matplotlib 3D skeleton + FuncAnimation─▶ animated GIF (the browser plays it automatically)
 
 Usage:
-    # Train and save a checkpoint with main.py first (defaults to reading runs/ckpt.pt)
-    uv run mmdit-motion/gradio-test.py --ckpt runs/ckpt.pt --use_ema
+    # Train and save a checkpoint with main.py first (defaults to reading models/ckpt.pt)
+    uv run mmdit-motion/gradio-test.py --ckpt models/ckpt.pt --use_ema
     # To correctly restore the motion scale (meters), add the HumanML3D folder so Mean/Std can be loaded:
-    uv run mmdit-motion/gradio-test.py --ckpt runs/ckpt.pt --data_root /path/to/HumanML3D
+    uv run mmdit-motion/gradio-test.py --ckpt models/ckpt.pt --data_root /path/to/HumanML3D
 Then open the browser at http://127.0.0.1:7860
 
 Notes:
@@ -245,7 +245,7 @@ def build_demo(model, text_tower, cfg, device, stats):
 def main():
     p = argparse.ArgumentParser(
         description="Gradio demo: load a text-to-motion MMDiT, prompt → 3D skeleton animation.")
-    p.add_argument("--ckpt", default="runs/ckpt.pt", help="path to the trained checkpoint")
+    p.add_argument("--ckpt", default="models/ckpt.pt", help="path to the trained checkpoint")
     p.add_argument("--use_ema", action="store_true", help="load EMA-smoothed weights")
     p.add_argument("--data_root", default="",
                    help="HumanML3D folder (load Mean/Std for denormalization; omit to display in normalized space)")
