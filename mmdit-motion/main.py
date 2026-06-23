@@ -373,9 +373,12 @@ class MotionMMDiT(nn.Module):
             )
 
             def _hook(_m, _inp, out):
-                # block out = [text(B,Lt,S,D), motion(B,Lm,S,Dm)]; reduce residual streams
-                motion_hidden = out[1].mean(
-                    dim=2)         # (B, Lm, dim_motion)
+                # block out = [text, motion]; motion is (B, Lm, S, Dm) with hyper-connection residual
+                # streams, or (B, Lm, Dm) when streams are disabled (num_residual_streams == 1 →
+                # expand_streams is nn.Identity). Reduce the stream axis only when it's present.
+                motion_hidden = out[1]
+                if motion_hidden.ndim == 4:
+                    motion_hidden = motion_hidden.mean(dim=2)   # (B, Lm, dim_motion)
                 self.repa_feat = motion_hidden
             self.mmdit.blocks[cfg.repa_layer].register_forward_hook(_hook)
 
