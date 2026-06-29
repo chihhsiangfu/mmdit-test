@@ -1,2 +1,5 @@
 [tool.uv.workspace]
 members = ["mmdit-motion"]
+
+[dependency-groups]
+dev = ["ipykernel", "jupyter", "nbformat"]
